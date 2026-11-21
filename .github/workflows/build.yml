@@ -77,6 +77,9 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
               <application
                   android:label="Müzik Telefon"
@@ -91,6 +94,8 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+                  <service android:name=".PollService" android:exported="false"
+                      android:foregroundServiceType="dataSync" />
               </application>
           </manifest>
           __END4__
@@ -170,7 +175,7 @@ jobs:
               }
 
               fun upload(baseUrl: String, appKey: String, user: String, file: File,
-                         title: String, thumb: String): Pair<Int, String> {
+                         title: String, thumb: String, jobId: String = ""): Pair<Int, String> {
                   val boundary = "----" + UUID.randomUUID()
                   val u = URL(baseUrl.trimEnd('/') + "/api/music/upload?user=" +
                       URLEncoder.encode(user, "UTF-8"))
@@ -191,6 +196,7 @@ jobs:
                       }
                       field("title", title)
                       field("thumb", thumb)
+                      if (jobId.isNotEmpty()) field("job_id", jobId)
                       o.writeBytes("--$boundary\r\nContent-Disposition: form-data; name=\"file\"; " +
                           "filename=\"s.mp3\"\r\nContent-Type: audio/mpeg\r\n\r\n")
                       file.inputStream().use { it.copyTo(o, 64 * 1024) }
@@ -204,12 +210,146 @@ jobs:
               }
           }
           __END5__
+          mkdir -p "$(dirname 'app/src/main/java/com/rqtm/muzik/PollService.kt')"
+          cat > 'app/src/main/java/com/rqtm/muzik/PollService.kt' <<'__END6__'
+          package com.rqtm.muzik
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.IBinder
+          import android.os.PowerManager
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          /**
+           * Odada yazılan -p komutlarını bottan alır, aramayı/indirmeyi/MP3 çevirmeyi telefonda yapar,
+           * bitmiş MP3'ü bota yükler. Telefon bota 2,5 sn'de bir sorar (bota bağlanan taraf telefon).
+           */
+          class PollService : Service() {
+              @Volatile private var running = false
+              private var thread: Thread? = null
+              private var wake: PowerManager.WakeLock? = null
+
+              private val prefs get() = getSharedPreferences("cfg", MODE_PRIVATE)
+              private fun server() = (prefs.getString("server", "") ?: "").trimEnd('/')
+              private fun key() = prefs.getString("key", "") ?: ""
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(i: Intent?, flags: Int, startId: Int): Int {
+                  val n = notif()
+                  if (Build.VERSION.SDK_INT >= 29)
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                  else startForeground(1, n)
+                  if (!running) {
+                      running = true
+                      wake = (getSystemService(POWER_SERVICE) as PowerManager)
+                          .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "muzik:poll").apply { acquire() }
+                      thread = Thread { loop() }.also { it.start() }
+                  }
+                  return START_STICKY
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  thread?.interrupt()
+                  if (wake?.isHeld == true) wake?.release()
+                  super.onDestroy()
+              }
+
+              private fun notif(): Notification {
+                  val ch = "poll"
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
+                          .createNotificationChannel(NotificationChannel(ch, "Müzik", NotificationManager.IMPORTANCE_LOW))
+                  }
+                  val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, ch) else Notification.Builder(this)
+                  return b.setContentTitle("Müzik Telefon").setContentText("Oda komutları dinleniyor")
+                      .setSmallIcon(android.R.drawable.ic_media_play).setOngoing(true).build()
+              }
+
+              private fun http(method: String, path: String, body: String? = null): Pair<Int, String> {
+                  val c = (URL(server() + path).openConnection() as HttpURLConnection).apply {
+                      requestMethod = method
+                      connectTimeout = 15000; readTimeout = 20000
+                      setRequestProperty("X-App-Key", key())
+                      if (body != null) {
+                          doOutput = true
+                          setRequestProperty("Content-Type", "application/json")
+                          outputStream.use { it.write(body.toByteArray()) }
+                      }
+                  }
+                  val code = c.responseCode
+                  val txt = (if (code in 200..299) c.inputStream else c.errorStream)?.bufferedReader()?.readText() ?: ""
+                  c.disconnect()
+                  return code to txt
+              }
+
+              private fun loop() {
+                  while (running) {
+                      try {
+                          if (server().isNotEmpty() && key().isNotEmpty()) {
+                              val (code, body) = http("GET", "/api/music/jobs/next")
+                              if (code == 200) {
+                                  val j = JSONObject(body)
+                                  if (!j.isNull("job")) { handle(j); continue }
+                              }
+                          }
+                      } catch (_: InterruptedException) { return } catch (_: Exception) { }
+                      try { Thread.sleep(2500) } catch (_: InterruptedException) { return }
+                  }
+              }
+
+              private val bad = listOf("remix", "live", "cover", "karaoke", "slowed", "reverb", "sped up",
+                  "nightcore", "8d", "instrumental", "full album", "playlist", "1 hour", "mix")
+
+              private fun handle(j: JSONObject) {
+                  val jobId = j.getString("job")
+                  val q = j.getString("q")
+                  val min = j.optInt("min_sec", 60)
+                  val max = j.optInt("max_sec", 720)
+                  var ok = false
+                  try {
+                      val all = LocalMusic.search(this, q).filter { it.duration == 0 || it.duration <= max }
+                      val ql = q.lowercase()
+                      val good = all.filter { s ->
+                          (s.duration == 0 || s.duration >= min) &&
+                              bad.none { b -> s.title.lowercase().contains(b) && !ql.contains(b) }
+                      }
+                      for (c in good.ifEmpty { all }.take(3)) {
+                          try {
+                              val f = LocalMusic.downloadMp3(this, c.url)
+                              try {
+                                  val r = LocalMusic.upload(server(), key(), "", f, c.title, c.thumb, jobId)
+                                  if (r.first == 200) ok = true
+                              } finally { f.delete() }
+                          } catch (_: Exception) { }
+                          if (ok) break
+                      }
+                  } catch (_: Exception) { }
+                  if (!ok) {
+                      try { http("POST", "/api/music/jobs/fail", JSONObject().put("job", jobId).toString()) }
+                      catch (_: Exception) { }
+                  }
+              }
+          }
+          __END6__
           mkdir -p "$(dirname 'app/src/main/java/com/rqtm/muzik/MainActivity.kt')"
-          cat > 'app/src/main/java/com/rqtm/muzik/MainActivity.kt' <<'__END6__'
+          cat > 'app/src/main/java/com/rqtm/muzik/MainActivity.kt' <<'__END7__'
           package com.rqtm.muzik
 
           import android.app.Activity
+          import android.Manifest
           import android.content.Context
+          import android.content.Intent
+          import android.os.Build
           import android.graphics.Color
           import android.os.Bundle
           import android.os.PowerManager
@@ -252,6 +392,28 @@ jobs:
                   val key = edit("APP_KEY", "key", true)
                   val user = edit("Highrise kullanıcı adın", "user")
                   val save = Button(this).apply { text = "Kaydet" }
+                  val listen = Button(this)
+                  fun refreshListen() {
+                      listen.text = if (prefs.getBoolean("listen", false))
+                          "Odadaki -p komutları bu telefonda: AÇIK (kapatmak için dokun)"
+                      else "Odadaki -p komutları bu telefonda: KAPALI (açmak için dokun)"
+                  }
+                  fun setListen(on: Boolean) {
+                      prefs.edit().putBoolean("listen", on).apply()
+                      val it = Intent(this, PollService::class.java)
+                      if (on) {
+                          if (Build.VERSION.SDK_INT >= 33)
+                              requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                          if (Build.VERSION.SDK_INT >= 26) startForegroundService(it) else startService(it)
+                      } else stopService(it)
+                      refreshListen()
+                  }
+                  listen.setOnClickListener { setListen(!prefs.getBoolean("listen", false)) }
+                  refreshListen()
+                  if (prefs.getBoolean("listen", false)) {
+                      val it = Intent(this, PollService::class.java)
+                      if (Build.VERSION.SDK_INT >= 26) startForegroundService(it) else startService(it)
+                  }
                   val q = edit("Şarkı ara...", "")
                   q.setText("")
                   val go = Button(this).apply { text = "Ara" }
@@ -275,7 +437,7 @@ jobs:
                   go.setOnClickListener { doSearch() }
                   q.setOnEditorActionListener { _, _, _ -> doSearch(); true }
 
-                  root.addView(server); root.addView(key); root.addView(user); root.addView(save)
+                  root.addView(server); root.addView(key); root.addView(user); root.addView(save); root.addView(listen)
                   val row = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
                   row.addView(q, LinearLayout.LayoutParams(0, -2, 1f)); row.addView(go)
                   root.addView(row); root.addView(status)
@@ -356,7 +518,7 @@ jobs:
                   }
               }
           }
-          __END6__
+          __END7__
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -369,3 +531,4 @@ jobs:
         with:
           name: muzik-telefon-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+          
