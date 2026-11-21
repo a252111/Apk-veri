@@ -1,0 +1,371 @@
+name: APK derle
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Proje dosyalarini olustur
+        run: |
+          set -e
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'__END0__'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google(); mavenCentral()
+                  maven { url = uri("https://jitpack.io") }
+              }
+          }
+          rootProject.name = "MuzikTelefon"
+          include(":app")
+          __END0__
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'__END1__'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          __END1__
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'__END2__'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          __END2__
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'__END3__'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.rqtm.muzik"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.rqtm.muzik"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+                  ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
+              }
+              buildTypes { release { isMinifyEnabled = false } }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              packaging { jniLibs { useLegacyPackaging = true } }
+          }
+
+          dependencies {
+              implementation("io.github.junkfood02.youtubedl-android:library:0.17.2")
+              implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.17.2")
+          }
+          __END3__
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'__END4__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+              <application
+                  android:label="Müzik Telefon"
+                  android:icon="@android:drawable/ic_media_play"
+                  android:extractNativeLibs="true"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          __END4__
+          mkdir -p "$(dirname 'app/src/main/java/com/rqtm/muzik/LocalMusic.kt')"
+          cat > 'app/src/main/java/com/rqtm/muzik/LocalMusic.kt' <<'__END5__'
+          package com.rqtm.muzik
+
+          import android.content.Context
+          import com.yausername.ffmpeg.FFmpeg
+          import com.yausername.youtubedl_android.YoutubeDL
+          import com.yausername.youtubedl_android.YoutubeDLRequest
+          import org.json.JSONObject
+          import java.io.DataOutputStream
+          import java.io.File
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.net.URLEncoder
+          import java.util.UUID
+
+          /** Arama + indirme + MP3 çevirme TELEFONDA yapılır. Bota sadece bitmiş MP3 yüklenir. */
+          object LocalMusic {
+              private var ready = false
+
+              @Synchronized
+              fun init(ctx: Context) {
+                  if (ready) return
+                  YoutubeDL.getInstance().init(ctx.applicationContext)
+                  FFmpeg.getInstance().init(ctx.applicationContext)
+                  ready = true
+              }
+
+              data class Song(val url: String, val title: String, val uploader: String,
+                              val duration: Int, val thumb: String)
+
+              fun search(ctx: Context, q: String): List<Song> {
+                  init(ctx)
+                  val out = ArrayList<Song>()
+                  for (prefix in listOf("scsearch8", "ytsearch8")) {
+                      try {
+                          val req = YoutubeDLRequest("$prefix:$q")
+                          req.addOption("--flat-playlist")
+                          req.addOption("-J")
+                          req.addOption("--no-warnings")
+                          val json = JSONObject(YoutubeDL.getInstance().execute(req).out)
+                          val arr = json.optJSONArray("entries") ?: continue
+                          for (i in 0 until arr.length()) {
+                              val e = arr.optJSONObject(i) ?: continue
+                              val url = e.optString("url").ifEmpty { e.optString("webpage_url") }
+                              if (!url.startsWith("http")) continue
+                              val th = e.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url") ?: ""
+                              out.add(Song(url, e.optString("title"),
+                                  e.optString("uploader", e.optString("channel")),
+                                  e.optInt("duration"), th))
+                          }
+                      } catch (_: Exception) { }
+                  }
+                  return out
+              }
+
+              /** Botun radyosuyla aynı format: 128 kbps, 44.1 kHz, stereo MP3. */
+              fun downloadMp3(ctx: Context, url: String): File {
+                  init(ctx)
+                  val dir = File(ctx.cacheDir, "songs").apply { mkdirs() }
+                  val id = UUID.randomUUID().toString()
+                  val req = YoutubeDLRequest(url)
+                  req.addOption("-f", "bestaudio[abr<=160]/bestaudio/best")
+                  req.addOption("--no-playlist")
+                  req.addOption("-x")
+                  req.addOption("--audio-format", "mp3")
+                  req.addOption("--audio-quality", "128K")
+                  req.addOption("--postprocessor-args", "ffmpeg:-ar 44100 -ac 2")
+                  req.addOption("-o", File(dir, "$id.%(ext)s").absolutePath)
+                  YoutubeDL.getInstance().execute(req)
+                  val f = File(dir, "$id.mp3")
+                  require(f.exists()) { "dosya oluşmadı" }
+                  return f
+              }
+
+              fun upload(baseUrl: String, appKey: String, user: String, file: File,
+                         title: String, thumb: String): Pair<Int, String> {
+                  val boundary = "----" + UUID.randomUUID()
+                  val u = URL(baseUrl.trimEnd('/') + "/api/music/upload?user=" +
+                      URLEncoder.encode(user, "UTF-8"))
+                  val conn = (u.openConnection() as HttpURLConnection).apply {
+                      requestMethod = "POST"
+                      doOutput = true
+                      connectTimeout = 20000
+                      readTimeout = 120000
+                      setChunkedStreamingMode(64 * 1024)
+                      setRequestProperty("X-App-Key", appKey)
+                      setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+                  }
+                  DataOutputStream(conn.outputStream).use { o ->
+                      fun field(n: String, v: String) {
+                          o.writeBytes("--$boundary\r\nContent-Disposition: form-data; name=\"$n\"\r\n\r\n")
+                          o.write(v.toByteArray(Charsets.UTF_8))
+                          o.writeBytes("\r\n")
+                      }
+                      field("title", title)
+                      field("thumb", thumb)
+                      o.writeBytes("--$boundary\r\nContent-Disposition: form-data; name=\"file\"; " +
+                          "filename=\"s.mp3\"\r\nContent-Type: audio/mpeg\r\n\r\n")
+                      file.inputStream().use { it.copyTo(o, 64 * 1024) }
+                      o.writeBytes("\r\n--$boundary--\r\n")
+                  }
+                  val code = conn.responseCode
+                  val body = (if (code in 200..299) conn.inputStream else conn.errorStream)
+                      ?.bufferedReader()?.readText() ?: ""
+                  conn.disconnect()
+                  return code to body
+              }
+          }
+          __END5__
+          mkdir -p "$(dirname 'app/src/main/java/com/rqtm/muzik/MainActivity.kt')"
+          cat > 'app/src/main/java/com/rqtm/muzik/MainActivity.kt' <<'__END6__'
+          package com.rqtm.muzik
+
+          import android.app.Activity
+          import android.content.Context
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.os.PowerManager
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.View
+          import android.view.inputmethod.InputMethodManager
+          import android.widget.*
+          import java.util.concurrent.Executors
+
+          class MainActivity : Activity() {
+              private val prefs by lazy { getSharedPreferences("cfg", MODE_PRIVATE) }
+              // Şarkılar sırayla (ardı ardına) işlenir
+              private val worker = Executors.newSingleThreadExecutor()
+              private val searcher = Executors.newSingleThreadExecutor()
+              private lateinit var status: TextView
+              private lateinit var results: LinearLayout
+              private var wake: PowerManager.WakeLock? = null
+              private var pending = 0
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun edit(hint: String, key: String, pass: Boolean = false): EditText =
+                  EditText(this).apply {
+                      this.hint = hint
+                      setText(prefs.getString(key, ""))
+                      setSingleLine()
+                      setTextColor(Color.WHITE); setHintTextColor(0xFF8899AA.toInt())
+                      if (pass) inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                  }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(0xFF111A22.toInt())
+                      setPadding(dp(14), dp(36), dp(14), dp(10))
+                  }
+                  val server = edit("Bot adresi (https://...)", "server")
+                  val key = edit("APP_KEY", "key", true)
+                  val user = edit("Highrise kullanıcı adın", "user")
+                  val save = Button(this).apply { text = "Kaydet" }
+                  val q = edit("Şarkı ara...", "")
+                  q.setText("")
+                  val go = Button(this).apply { text = "Ara" }
+                  status = TextView(this).apply { setTextColor(0xFFAAB6C2.toInt()); setPadding(0, dp(6), 0, dp(6)) }
+                  results = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+                  save.setOnClickListener {
+                      prefs.edit().putString("server", server.text.toString().trim())
+                          .putString("key", key.text.toString().trim())
+                          .putString("user", user.text.toString().trim().removePrefix("@")).apply()
+                      toast("Kaydedildi")
+                  }
+                  val doSearch = {
+                      val text = q.text.toString().trim()
+                      if (text.length >= 2) {
+                          (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
+                              .hideSoftInputFromWindow(q.windowToken, 0)
+                          search(text)
+                      }
+                  }
+                  go.setOnClickListener { doSearch() }
+                  q.setOnEditorActionListener { _, _, _ -> doSearch(); true }
+
+                  root.addView(server); root.addView(key); root.addView(user); root.addView(save)
+                  val row = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+                  row.addView(q, LinearLayout.LayoutParams(0, -2, 1f)); row.addView(go)
+                  root.addView(row); root.addView(status)
+                  root.addView(ScrollView(this).apply { addView(results) },
+                      LinearLayout.LayoutParams(-1, 0, 1f))
+                  setContentView(root)
+                  status.text = "Hazır. Şarkı ara, + ile ekle."
+              }
+
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+              private fun ui(f: () -> Unit) = runOnUiThread { f() }
+
+              private fun search(text: String) {
+                  status.text = "Aranıyor..."
+                  results.removeAllViews()
+                  searcher.execute {
+                      val list = try { LocalMusic.search(this, text) } catch (e: Exception) { null }
+                      ui {
+                          if (list == null) { status.text = "Arama hatası"; return@ui }
+                          status.text = if (list.isEmpty()) "Sonuç yok" else ""
+                          list.forEach { s -> results.addView(row(s)) }
+                      }
+                  }
+              }
+
+              private fun row(s: LocalMusic.Song): View {
+                  val min = s.duration / 60; val sec = s.duration % 60
+                  val t = TextView(this).apply {
+                      text = s.title + "\n" + s.uploader + (if (s.duration > 0) "  ·  %d:%02d".format(min, sec) else "")
+                      setTextColor(Color.WHITE); textSize = 14f
+                      setPadding(dp(4), dp(10), dp(4), dp(10))
+                  }
+                  val add = Button(this).apply { text = "+" }
+                  add.setOnClickListener { add.isEnabled = false; enqueue(s) }
+                  return LinearLayout(this).apply {
+                      gravity = Gravity.CENTER_VERTICAL
+                      addView(t, LinearLayout.LayoutParams(0, -2, 1f)); addView(add)
+                  }
+              }
+
+              private fun enqueue(s: LocalMusic.Song) {
+                  val server = prefs.getString("server", "") ?: ""
+                  val key = prefs.getString("key", "") ?: ""
+                  val user = prefs.getString("user", "") ?: ""
+                  if (server.isEmpty() || key.isEmpty() || user.isEmpty()) {
+                      toast("Önce bot adresi, APP_KEY ve kullanıcı adını kaydet"); return
+                  }
+                  pending++
+                  if (wake == null) {
+                      wake = (getSystemService(POWER_SERVICE) as PowerManager)
+                          .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "muzik:work")
+                  }
+                  if (wake?.isHeld == false) wake?.acquire(60 * 60 * 1000L)
+                  ui { status.text = "Sırada: $pending şarkı işleniyor..." }
+                  worker.execute {
+                      var msg: String
+                      try {
+                          val f = LocalMusic.downloadMp3(this, s.url)
+                          try {
+                              val r = LocalMusic.upload(server, key, user, f, s.title, s.thumb)
+                              msg = when (r.first) {
+                                  200 -> "Eklendi: ${s.title.take(40)}"
+                                  403 -> "Yetki yok (APP_KEY yanlış ya da sadece sahip ekleyebilir)"
+                                  404 -> "Odada görünmüyorsun, kullanıcı adını kontrol et"
+                                  400 -> "Reddedildi (süre/biçim): " + r.second.take(60)
+                                  else -> "Hata ${r.first}"
+                              }
+                          } finally { f.delete() }
+                      } catch (e: Exception) {
+                          msg = "Başarısız: " + (e.message ?: "bilinmeyen").take(80)
+                      }
+                      pending--
+                      ui {
+                          toast(msg)
+                          status.text = if (pending > 0) "Sırada: $pending şarkı işleniyor..." else msg
+                          if (pending == 0 && wake?.isHeld == true) wake?.release()
+                      }
+                  }
+              }
+          }
+          __END6__
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: muzik-telefon-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
