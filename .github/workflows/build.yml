@@ -127,6 +127,17 @@ jobs:
                   ready = true
               }
 
+              private var lastUpdate = 0L
+
+              /** yt-dlp'yi günceller (YouTube sık değişir). minGapMs: en son güncellemeden bu yana geçmesi gereken süre. */
+              @Synchronized
+              fun updateYtDlp(ctx: Context, minGapMs: Long) {
+                  if (System.currentTimeMillis() - lastUpdate < minGapMs) return
+                  init(ctx)
+                  try { YoutubeDL.getInstance().updateYoutubeDL(ctx.applicationContext) } catch (_: Exception) { }
+                  lastUpdate = System.currentTimeMillis()
+              }
+
               data class Song(val url: String, val title: String, val uploader: String,
                               val duration: Int, val thumb: String)
 
@@ -158,6 +169,15 @@ jobs:
               /** Botun radyosuyla aynı format: 128 kbps, 44.1 kHz, stereo MP3. */
               fun downloadMp3(ctx: Context, url: String): File {
                   init(ctx)
+                  return try {
+                      downloadOnce(ctx, url)
+                  } catch (e: Exception) {
+                      updateYtDlp(ctx, 10 * 60 * 1000L)
+                      downloadOnce(ctx, url)
+                  }
+              }
+
+              private fun downloadOnce(ctx: Context, url: String): File {
                   val dir = File(ctx.cacheDir, "songs").apply { mkdirs() }
                   val id = UUID.randomUUID().toString()
                   val req = YoutubeDLRequest(url)
@@ -252,7 +272,10 @@ jobs:
                       running = true
                       wake = (getSystemService(POWER_SERVICE) as PowerManager)
                           .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "muzik:poll").apply { acquire() }
-                      thread = Thread { loop() }.also { it.start() }
+                      thread = Thread {
+                          LocalMusic.updateYtDlp(this, 6 * 60 * 60 * 1000L)
+                          loop()
+                      }.also { it.start() }
                   }
                   return START_STICKY
               }
@@ -380,7 +403,7 @@ jobs:
                       setTextColor(Color.WHITE); setHintTextColor(0xFF8899AA.toInt())
                       if (pass) inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
                   }
-
+                  
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
                   val root = LinearLayout(this).apply {
@@ -445,6 +468,7 @@ jobs:
                       LinearLayout.LayoutParams(-1, 0, 1f))
                   setContentView(root)
                   status.text = "Hazır. Şarkı ara, + ile ekle."
+                  Thread { LocalMusic.updateYtDlp(this, 6 * 60 * 60 * 1000L) }.start()
               }
 
               private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
@@ -531,4 +555,3 @@ jobs:
         with:
           name: muzik-telefon-apk
           path: app/build/outputs/apk/debug/app-debug.apk
-          
