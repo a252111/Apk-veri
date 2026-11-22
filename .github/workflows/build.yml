@@ -141,27 +141,43 @@ jobs:
               data class Song(val url: String, val title: String, val uploader: String,
                               val duration: Int, val thumb: String)
 
+              private fun searchOne(prefix: String, q: String, flat: Boolean): List<Song> {
+                  val out = ArrayList<Song>()
+                  try {
+                      val req = YoutubeDLRequest("$prefix:$q")
+                      if (flat) req.addOption("--flat-playlist")
+                      req.addOption("-J")
+                      req.addOption("--no-warnings")
+                      val json = JSONObject(YoutubeDL.getInstance().execute(req).out)
+                      val arr = json.optJSONArray("entries") ?: return out
+                      for (i in 0 until arr.length()) {
+                          val e = arr.optJSONObject(i) ?: continue
+                          // flat: "url" video adresidir. flat değilse "url" ses akışıdır, sayfa adresi webpage_url'dir.
+                          val url = if (flat) e.optString("url").ifEmpty { e.optString("webpage_url") }
+                                    else e.optString("webpage_url").ifEmpty { e.optString("url") }
+                          if (!url.startsWith("http")) continue
+                          val th = e.optString("thumbnail").ifEmpty {
+                              e.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url") ?: "" }
+                          out.add(Song(url, e.optString("title"),
+                              e.optString("uploader", e.optString("channel")),
+                              e.optInt("duration"), th))
+                      }
+                  } catch (_: Exception) { }
+                  return out
+              }
+
+              /** SoundCloud ve YouTube aynı anda aranır, sonuçlar sırayla karıştırılır. */
               fun search(ctx: Context, q: String): List<Song> {
                   init(ctx)
+                  var sc: List<Song> = emptyList()
+                  var yt: List<Song> = emptyList()
+                  val t1 = Thread { sc = searchOne("scsearch6", q, false) }
+                  val t2 = Thread { yt = searchOne("ytsearch8", q, true) }
+                  t1.start(); t2.start(); t1.join(); t2.join()
                   val out = ArrayList<Song>()
-                  for (prefix in listOf("scsearch8", "ytsearch8")) {
-                      try {
-                          val req = YoutubeDLRequest("$prefix:$q")
-                          req.addOption("--flat-playlist")
-                          req.addOption("-J")
-                          req.addOption("--no-warnings")
-                          val json = JSONObject(YoutubeDL.getInstance().execute(req).out)
-                          val arr = json.optJSONArray("entries") ?: continue
-                          for (i in 0 until arr.length()) {
-                              val e = arr.optJSONObject(i) ?: continue
-                              val url = e.optString("url").ifEmpty { e.optString("webpage_url") }
-                              if (!url.startsWith("http")) continue
-                              val th = e.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url") ?: ""
-                              out.add(Song(url, e.optString("title"),
-                                  e.optString("uploader", e.optString("channel")),
-                                  e.optInt("duration"), th))
-                          }
-                      } catch (_: Exception) { }
+                  for (i in 0 until maxOf(sc.size, yt.size)) {
+                      if (i < sc.size) out.add(sc[i])
+                      if (i < yt.size) out.add(yt[i])
                   }
                   return out
               }
@@ -403,7 +419,7 @@ jobs:
                       setTextColor(Color.WHITE); setHintTextColor(0xFF8899AA.toInt())
                       if (pass) inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
                   }
-                  
+
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
                   val root = LinearLayout(this).apply {
