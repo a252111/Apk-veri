@@ -80,9 +80,11 @@ jobs:
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
               <application
-                  android:label="Müzik Telefon"
+                  android:label="موسيقى الهاتف"
+                  android:supportsRtl="true"
                   android:icon="@android:drawable/ic_media_play"
                   android:extractNativeLibs="true"
                   android:usesCleartextTraffic="true"
@@ -133,9 +135,11 @@ jobs:
               @Synchronized
               fun updateYtDlp(ctx: Context, minGapMs: Long) {
                   if (System.currentTimeMillis() - lastUpdate < minGapMs) return
-                  init(ctx)
-                  try { YoutubeDL.getInstance().updateYoutubeDL(ctx.applicationContext) } catch (_: Exception) { }
                   lastUpdate = System.currentTimeMillis()
+                  try {
+                      init(ctx)
+                      YoutubeDL.getInstance().updateYoutubeDL(ctx.applicationContext)
+                  } catch (_: Throwable) { }
               }
 
               data class Song(val url: String, val title: String, val uploader: String,
@@ -192,7 +196,7 @@ jobs:
                       downloadOnce(ctx, url)
                   }
               }
-
+              
               private fun downloadOnce(ctx: Context, url: String): File {
                   val dir = File(ctx.cacheDir, "songs").apply { mkdirs() }
                   val id = UUID.randomUUID().toString()
@@ -259,6 +263,7 @@ jobs:
           import android.content.pm.ServiceInfo
           import android.os.Build
           import android.os.IBinder
+          import android.net.wifi.WifiManager
           import android.os.PowerManager
           import org.json.JSONObject
           import java.net.HttpURLConnection
@@ -272,6 +277,7 @@ jobs:
               @Volatile private var running = false
               private var thread: Thread? = null
               private var wake: PowerManager.WakeLock? = null
+              private var wifi: WifiManager.WifiLock? = null
 
               private val prefs get() = getSharedPreferences("cfg", MODE_PRIVATE)
               private fun server() = (prefs.getString("server", "") ?: "").trimEnd('/')
@@ -288,10 +294,13 @@ jobs:
                       running = true
                       wake = (getSystemService(POWER_SERVICE) as PowerManager)
                           .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "muzik:poll").apply { acquire() }
-                      thread = Thread {
-                          LocalMusic.updateYtDlp(this, 6 * 60 * 60 * 1000L)
-                          loop()
-                      }.also { it.start() }
+                      try {
+                          @Suppress("DEPRECATION")
+                          wifi = (applicationContext.getSystemService(WIFI_SERVICE) as WifiManager)
+                              .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "muzik:wifi").apply { acquire() }
+                      } catch (_: Throwable) { }
+                      thread = Thread { loop() }.also { it.start() }
+                      Thread { LocalMusic.updateYtDlp(this, 6 * 60 * 60 * 1000L) }.start()
                   }
                   return START_STICKY
               }
@@ -300,17 +309,26 @@ jobs:
                   running = false
                   thread?.interrupt()
                   if (wake?.isHeld == true) wake?.release()
+                  try { if (wifi?.isHeld == true) wifi?.release() } catch (_: Throwable) { }
                   super.onDestroy()
               }
 
-              private fun notif(): Notification {
+              private var lastStatus = ""
+              private fun status(t: String) {
+                  if (t == lastStatus) return
+                  lastStatus = t
+                  try { (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(1, notif(t)) }
+                  catch (_: Throwable) { }
+              }
+
+              private fun notif(text: String = "جارٍ الاستماع لأوامر الغرفة"): Notification {
                   val ch = "poll"
                   if (Build.VERSION.SDK_INT >= 26) {
                       (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
-                          .createNotificationChannel(NotificationChannel(ch, "Müzik", NotificationManager.IMPORTANCE_LOW))
+                          .createNotificationChannel(NotificationChannel(ch, "الموسيقى", NotificationManager.IMPORTANCE_LOW))
                   }
                   val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, ch) else Notification.Builder(this)
-                  return b.setContentTitle("Müzik Telefon").setContentText("Oda komutları dinleniyor")
+                  return b.setContentTitle("موسيقى الهاتف").setContentText(text)
                       .setSmallIcon(android.R.drawable.ic_media_play).setOngoing(true).build()
               }
 
@@ -334,14 +352,19 @@ jobs:
               private fun loop() {
                   while (running) {
                       try {
-                          if (server().isNotEmpty() && key().isNotEmpty()) {
+                          if (server().isEmpty() || key().isEmpty()) {
+                              status("لم يتم إدخال عنوان البوت أو المفتاح")
+                          } else {
                               val (code, body) = http("GET", "/api/music/jobs/next")
                               if (code == 200) {
+                                  status("متصل، بانتظار الطلبات")
                                   val j = JSONObject(body)
                                   if (!j.isNull("job")) { handle(j); continue }
-                              }
+                              } else if (code == 403) status("مفتاح التطبيق خاطئ (403)")
+                              else status("البوت أعاد خطأ ($code)")
                           }
-                      } catch (_: InterruptedException) { return } catch (_: Exception) { }
+                      } catch (_: InterruptedException) { return }
+                      catch (e: Throwable) { status("تعذّر الاتصال بالبوت: " + (e.message ?: "").take(40)) }
                       try { Thread.sleep(2500) } catch (_: InterruptedException) { return }
                   }
               }
@@ -388,6 +411,8 @@ jobs:
           import android.Manifest
           import android.content.Context
           import android.content.Intent
+          import android.net.Uri
+          import android.provider.Settings
           import android.os.Build
           import android.graphics.Color
           import android.os.Bundle
@@ -426,16 +451,17 @@ jobs:
                       orientation = LinearLayout.VERTICAL
                       setBackgroundColor(0xFF111A22.toInt())
                       setPadding(dp(14), dp(36), dp(14), dp(10))
+                      layoutDirection = View.LAYOUT_DIRECTION_RTL
                   }
-                  val server = edit("Bot adresi (https://...)", "server")
-                  val key = edit("APP_KEY", "key", true)
-                  val user = edit("Highrise kullanıcı adın", "user")
-                  val save = Button(this).apply { text = "Kaydet" }
+                  val server = edit("عنوان البوت (http://...)", "server")
+                  val key = edit("مفتاح التطبيق APP_KEY", "key", true)
+                  val user = edit("اسم المستخدم في Highrise", "user")
+                  val save = Button(this).apply { text = "حفظ" }
                   val listen = Button(this)
                   fun refreshListen() {
                       listen.text = if (prefs.getBoolean("listen", false))
-                          "Odadaki -p komutları bu telefonda: AÇIK (kapatmak için dokun)"
-                      else "Odadaki -p komutları bu telefonda: KAPALI (açmak için dokun)"
+                          "أوامر -p في الغرفة تعمل على هذا الهاتف: مفعّل (اضغط للإيقاف)"
+                      else "أوامر -p في الغرفة تعمل على هذا الهاتف: متوقف (اضغط للتفعيل)"
                   }
                   fun setListen(on: Boolean) {
                       prefs.edit().putBoolean("listen", on).apply()
@@ -453,9 +479,49 @@ jobs:
                       val it = Intent(this, PollService::class.java)
                       if (Build.VERSION.SDK_INT >= 26) startForegroundService(it) else startService(it)
                   }
-                  val q = edit("Şarkı ara...", "")
+                  val pkg = Uri.parse("package:$packageName")
+                  fun cmp(a: String, b: String) = Intent().setClassName(a, b)
+                  // Verilen ekranları sırayla dener, hiçbiri açılmazsa uygulamanın genel ayarlarını açar
+                  fun openFirst(vararg list: Intent) {
+                      for (i in list) {
+                          try { startActivity(i); return } catch (_: Throwable) { }
+                      }
+                      try { startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, pkg)) }
+                      catch (_: Throwable) { toast("تعذّر فتح الإعدادات") }
+                  }
+                  fun settingsBtn(label: String, action: () -> Unit) = Button(this).apply {
+                      text = label; setOnClickListener { action() }
+                  }
+                  val pm = getSystemService(POWER_SERVICE) as PowerManager
+                  val bBattery = settingsBtn("1) إزالة قيود البطارية") {
+                      if (pm.isIgnoringBatteryOptimizations(packageName)) toast("قيود البطارية معطّلة بالفعل")
+                      else openFirst(
+                          Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, pkg),
+                          Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                  }
+                  val bAuto = settingsBtn("2) التشغيل التلقائي / العمل في الخلفية") {
+                      openFirst(
+                          cmp("com.miui.securitycenter", "com.miui.permcenter.autostart.AutoStartManagementActivity"),
+                          cmp("com.coloros.safecenter", "com.coloros.safecenter.permission.startup.StartupAppListActivity"),
+                          cmp("com.oppo.safe", "com.oppo.safe.permission.startup.StartupAppListActivity"),
+                          cmp("com.vivo.permissionmanager", "com.vivo.permissionmanager.activity.BgStartUpManagerActivity"),
+                          cmp("com.iqoo.secure", "com.iqoo.secure.ui.phoneoptimize.AddWhiteListActivity"),
+                          cmp("com.huawei.systemmanager", "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity"),
+                          cmp("com.samsung.android.lool", "com.samsung.android.sm.ui.battery.BatteryActivity"))
+                  }
+                  val bData = settingsBtn("3) إذن البيانات غير المحدودة") {
+                      openFirst(Intent(Settings.ACTION_IGNORE_BACKGROUND_DATA_RESTRICTIONS_SETTINGS, pkg))
+                  }
+                  val bNotif = settingsBtn("4) إذن الإشعارات") {
+                      openFirst(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                          .putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
+                  }
+                                    val bApp = settingsBtn("5) إعدادات التطبيق (البطارية، الأذونات)") {
+                      openFirst(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, pkg))
+                  }
+                  val q = edit("ابحث عن أغنية...", "")
                   q.setText("")
-                  val go = Button(this).apply { text = "Ara" }
+                  val go = Button(this).apply { text = "بحث" }
                   status = TextView(this).apply { setTextColor(0xFFAAB6C2.toInt()); setPadding(0, dp(6), 0, dp(6)) }
                   results = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
@@ -463,7 +529,7 @@ jobs:
                       prefs.edit().putString("server", server.text.toString().trim())
                           .putString("key", key.text.toString().trim())
                           .putString("user", user.text.toString().trim().removePrefix("@")).apply()
-                      toast("Kaydedildi")
+                      toast("تم الحفظ")
                   }
                   val doSearch = {
                       val text = q.text.toString().trim()
@@ -477,13 +543,17 @@ jobs:
                   q.setOnEditorActionListener { _, _, _ -> doSearch(); true }
 
                   root.addView(server); root.addView(key); root.addView(user); root.addView(save); root.addView(listen)
+                  listOf(bBattery, bAuto, bData, bNotif, bApp).forEach { root.addView(it) }
                   val row = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
                   row.addView(q, LinearLayout.LayoutParams(0, -2, 1f)); row.addView(go)
                   root.addView(row); root.addView(status)
-                  root.addView(ScrollView(this).apply { addView(results) },
-                      LinearLayout.LayoutParams(-1, 0, 1f))
-                  setContentView(root)
-                  status.text = "Hazır. Şarkı ara, + ile ekle."
+                  root.addView(results)
+                  setContentView(ScrollView(this).apply {
+                      isFillViewport = true
+                      setBackgroundColor(0xFF111A22.toInt())
+                      addView(root)
+                  })
+                  status.text = "جاهز. ابحث عن أغنية واضغط + للإضافة."
                   Thread { LocalMusic.updateYtDlp(this, 6 * 60 * 60 * 1000L) }.start()
               }
 
@@ -491,13 +561,13 @@ jobs:
               private fun ui(f: () -> Unit) = runOnUiThread { f() }
 
               private fun search(text: String) {
-                  status.text = "Aranıyor..."
+                  status.text = "جارٍ البحث..."
                   results.removeAllViews()
                   searcher.execute {
                       val list = try { LocalMusic.search(this, text) } catch (e: Exception) { null }
                       ui {
-                          if (list == null) { status.text = "Arama hatası"; return@ui }
-                          status.text = if (list.isEmpty()) "Sonuç yok" else ""
+                          if (list == null) { status.text = "خطأ في البحث"; return@ui }
+                          status.text = if (list.isEmpty()) "لا توجد نتائج" else ""
                           list.forEach { s -> results.addView(row(s)) }
                       }
                   }
@@ -523,7 +593,7 @@ jobs:
                   val key = prefs.getString("key", "") ?: ""
                   val user = prefs.getString("user", "") ?: ""
                   if (server.isEmpty() || key.isEmpty() || user.isEmpty()) {
-                      toast("Önce bot adresi, APP_KEY ve kullanıcı adını kaydet"); return
+                      toast("احفظ عنوان البوت والمفتاح واسم المستخدم أولاً"); return
                   }
                   pending++
                   if (wake == null) {
@@ -531,7 +601,7 @@ jobs:
                           .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "muzik:work")
                   }
                   if (wake?.isHeld == false) wake?.acquire(60 * 60 * 1000L)
-                  ui { status.text = "Sırada: $pending şarkı işleniyor..." }
+                  ui { status.text = "قيد المعالجة: $pending أغنية..." }
                   worker.execute {
                       var msg: String
                       try {
@@ -539,20 +609,20 @@ jobs:
                           try {
                               val r = LocalMusic.upload(server, key, user, f, s.title, s.thumb)
                               msg = when (r.first) {
-                                  200 -> "Eklendi: ${s.title.take(40)}"
-                                  403 -> "Yetki yok (APP_KEY yanlış ya da sadece sahip ekleyebilir)"
-                                  404 -> "Odada görünmüyorsun, kullanıcı adını kontrol et"
-                                  400 -> "Reddedildi (süre/biçim): " + r.second.take(60)
-                                  else -> "Hata ${r.first}"
+                                  200 -> "تمت الإضافة: ${s.title.take(40)}"
+                                  403 -> "لا توجد صلاحية (المفتاح خاطئ أو للمالك فقط)"
+                                  404 -> "لا تظهر في الغرفة، تحقق من اسم المستخدم"
+                                  400 -> "مرفوض (المدة/الصيغة): " + r.second.take(60)
+                                  else -> "خطأ ${r.first}"
                               }
                           } finally { f.delete() }
                       } catch (e: Exception) {
-                          msg = "Başarısız: " + (e.message ?: "bilinmeyen").take(80)
+                          msg = "فشل: " + (e.message ?: "غير معروف").take(80)
                       }
                       pending--
                       ui {
                           toast(msg)
-                          status.text = if (pending > 0) "Sırada: $pending şarkı işleniyor..." else msg
+                          status.text = if (pending > 0) "قيد المعالجة: $pending أغنية..." else msg
                           if (pending == 0 && wake?.isHeld == true) wake?.release()
                       }
                   }
@@ -571,3 +641,4 @@ jobs:
         with:
           name: muzik-telefon-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+          
